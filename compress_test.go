@@ -541,6 +541,93 @@ func TestCompressedWhisperReadWrite3(t *testing.T) {
 	}
 }
 
+func TestMixAggregationCompressed(t *testing.T) {
+	fpath := "mix.cwsp"
+	os.Remove(fpath)
+
+	whisper, err := CreateWithOptions(
+		fpath,
+		[]*Retention{
+			{secondsPerPoint: 1, numberOfPoints: 172800},   // 1s:2d
+			{secondsPerPoint: 60, numberOfPoints: 40320},   // 1m:28d
+			{secondsPerPoint: 3600, numberOfPoints: 17520}, // 1h:2y
+		},
+		Mix,
+		0,
+		&Options{
+			Compressed: true, PointsPerBlock: 7200, InMemory: true,
+			MixAggregationSpecs: []MixAggregationSpec{
+				{Method: Average, Percentile: 0},
+				{Method: Sum, Percentile: 0},
+				{Method: Last, Percentile: 0},
+				{Method: Max, Percentile: 0},
+				{Method: Min, Percentile: 0},
+				{Method: Percentile, Percentile: 50},
+				{Method: Percentile, Percentile: 95},
+				{Method: Percentile, Percentile: 99},
+			},
+		},
+	)
+	if err != nil {
+		panic(err)
+	}
+	// whisper.Close()
+
+	// var now = time.Now()
+	// var total = 60*60*24*365*2 + 37
+	var start = time.Now().Add(time.Duration(time.Hour * -24))
+	// var start = time.Unix(1491778800, 0)
+	Now = func() time.Time { return start }
+	defer func() { Now = func() time.Time { return time.Now() } }()
+
+	var ps []*TimeSeriesPoint
+	for i := 0; i < 24*60*60; i++ {
+		ps = append(ps, &TimeSeriesPoint{
+			Time: int(start.Unix()),
+			// Value: float64(rand.Intn(100000)),
+			Value: float64(i),
+		})
+		start = start.Add(time.Second)
+	}
+	if err := whisper.UpdateMany(ps); err != nil {
+		t.Fatal(err)
+	}
+	if err := whisper.Close(); err != nil {
+		t.Fatal(err)
+	}
+	whisper.file.(*memFile).dumpOnDisk(fpath)
+
+	// TODO: make some real data validations
+	{
+		vals, err := whisper.FetchByAggregation(int(Now().Add(time.Hour*24*-3).Unix()), int(Now().Unix()), &MixAggregationSpec{Method: Last})
+		if err != nil {
+			t.Error(err)
+		}
+		log.Printf("vals = %+v\n", vals)
+	}
+	{
+		vals, err := whisper.FetchByAggregation(int(Now().Add(time.Hour*24*-3).Unix()), int(Now().Unix()), &MixAggregationSpec{Method: Percentile, Percentile: 50})
+		if err != nil {
+			t.Error(err)
+		}
+		log.Printf("vals = %+v\n", vals)
+	}
+	{
+		vals, err := whisper.FetchByAggregation(int(Now().Add(time.Hour*24*-30).Unix()), int(Now().Unix()), &MixAggregationSpec{Method: Last})
+		if err != nil {
+			t.Error(err)
+		}
+		log.Printf("vals = %+v\n", vals)
+	}
+	{
+		vals, err := whisper.FetchByAggregation(int(Now().Add(time.Hour*24*-30).Unix()), int(Now().Unix()), &MixAggregationSpec{Method: Percentile, Percentile: 50})
+		if err != nil {
+			t.Error(err)
+		}
+		log.Printf("vals = %+v\n", vals)
+	}
+}
+
 func TestCompressTo(t *testing.T) {
 	fpath := "compress_to.wsp"
 	os.Remove(fpath)

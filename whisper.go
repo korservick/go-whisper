@@ -20,6 +20,7 @@ import (
 
 const (
 	// size constants
+	ByteSize        = 1
 	IntSize         = 4
 	FloatSize       = 4
 	Float64Size     = 8
@@ -37,6 +38,7 @@ const (
 	Years   = 86400 * 365
 )
 
+// Note: 4 bytes long in Whisper Header, 1 byte long in Archive Header
 type AggregationMethod int
 
 const (
@@ -45,6 +47,9 @@ const (
 	Last
 	Max
 	Min
+
+	Mix        // only used in whisper header
+	Percentile // only used in archive header
 )
 
 func (am AggregationMethod) String() string {
@@ -59,9 +64,15 @@ func (am AggregationMethod) String() string {
 		return "max"
 	case Min:
 		return "min"
+	case Mix:
+		return "mix"
+	case Percentile:
+		return "percentile"
 	}
 	return fmt.Sprintf("%d", am)
 }
+
+// func ParseAggregationMethods() {}
 
 type Options struct {
 	Sparse bool
@@ -72,6 +83,18 @@ type Options struct {
 	PointSize      float32
 	InMemory       bool
 	OpenFileFlag   *int
+
+	MixAggregationSpecs []MixAggregationSpec
+}
+
+type MixAggregationSpec struct {
+	Method     AggregationMethod
+	Percentile float32
+}
+
+func ParseMixAggregationSpecs(spec string) []MixAggregationSpec {
+	// TODO
+	return nil
 }
 
 func unitMultiplier(s string) (int, error) {
@@ -265,7 +288,7 @@ func CreateWithOptions(path string, retentions Retentions, aggregationMethod Agg
 	}
 
 	// Set the archive info
-	for _, retention := range retentions {
+	for i, retention := range retentions {
 		archive := &archiveInfo{Retention: *retention}
 
 		if archive.avgCompressedPointSize == 0 {
@@ -275,15 +298,29 @@ func CreateWithOptions(path string, retentions Retentions, aggregationMethod Agg
 			archive.blockCount = whisper.blockCount(archive)
 		}
 
-		whisper.archives = append(whisper.archives, archive)
+		if whisper.aggregationMethod == Mix && i > 0 {
+			for _, spec := range options.MixAggregationSpecs {
+				narchive := *archive
+				narchive.aggregationSpec = &MixAggregationSpec{Method: spec.Method, Percentile: spec.Percentile}
+				whisper.archives = append(whisper.archives, &narchive)
+			}
+		} else {
+			whisper.archives = append(whisper.archives, archive)
+		}
 	}
 
 	offset := whisper.MetadataSize()
 	for i, retention := range retentions {
-		archive := whisper.archives[i]
-		archive.offset = offset
+		if !whisper.compressed {
+			archive := whisper.archives[i]
+			archive.offset = offset
+			offset += retention.Size()
 
-		if whisper.compressed {
+			continue
+		}
+
+		if whisper.aggregationMethod != Mix || i == 0 {
+			archive := whisper.archives[i]
 			if math.IsNaN(float64(archive.avgCompressedPointSize)) || archive.avgCompressedPointSize <= 0 {
 				archive.avgCompressedPointSize = avgCompressedPointSize
 			}
@@ -295,14 +332,26 @@ func CreateWithOptions(path string, retentions Retentions, aggregationMethod Agg
 			ppb := archive.calculateSuitablePointsPerBlock(whisper.pointsPerBlock)
 			archive.blockSize = int(math.Ceil(float64(ppb)*float64(archive.avgCompressedPointSize))) + endOfBlockSize
 			archive.blockRanges = make([]blockRange, archive.blockCount)
+
+			archive.offset = offset
 			offset += archive.blockSize * archive.blockCount
 
 			if i > 0 {
 				size := archive.secondsPerPoint / whisper.archives[i-1].secondsPerPoint * PointSize * 2
 				whisper.archives[i-1].buffer = make([]byte, size)
 			}
-		} else {
-			offset += retention.Size()
+
+			continue
+		}
+
+		for j := range options.MixAggregationSpecs {
+			archive := whisper.archives[1+(i-1)*len(options.MixAggregationSpecs)+j]
+			archive.cblock.lastByteBitPos = 7
+			archive.blockSize = int(math.Ceil(float64(whisper.pointsPerBlock)*float64(archive.avgCompressedPointSize))) + endOfBlockSize
+			archive.blockRanges = make([]blockRange, archive.blockCount)
+
+			archive.offset = offset
+			offset += archive.blockSize * archive.blockCount
 		}
 	}
 
@@ -498,7 +547,10 @@ func (whisper *Whisper) initMetaInfo() {
 
 		prevArc := whisper.archives[i-1]
 		prevArc.next = arc
-		prevArc.bufferSize = arc.secondsPerPoint / prevArc.secondsPerPoint * PointSize * bufferCount
+
+		if whisper.aggregationMethod != Mix {
+			prevArc.bufferSize = arc.secondsPerPoint / prevArc.secondsPerPoint * PointSize * bufferCount
+		}
 	}
 }
 
@@ -708,6 +760,11 @@ func (whisper *Whisper) UpdateManyForArchive(points []*TimeSeriesPoint, archiveS
 		// reverse currentPoints
 		reversePoints(currentPoints)
 		if whisper.compressed {
+			// backfilling lower archives is not allowed/supported for mix aggreation policy
+			if whisper.aggregationMethod == Mix && i > 0 {
+				break
+			}
+
 			err = whisper.archiveUpdateManyCompressed(archive, currentPoints)
 		} else {
 			err = whisper.archiveUpdateMany(archive, currentPoints)
@@ -985,6 +1042,10 @@ func (whisper *Whisper) StartTime() int {
   Fetch a TimeSeries for a given time span from the file.
 */
 func (whisper *Whisper) Fetch(fromTime, untilTime int) (timeSeries *TimeSeries, err error) {
+	return whisper.FetchByAggregation(fromTime, untilTime, nil)
+}
+
+func (whisper *Whisper) FetchByAggregation(fromTime, untilTime int, spec *MixAggregationSpec) (timeSeries *TimeSeries, err error) {
 	now := int(Now().Unix()) // TODO: danger of 2030 something overflow
 	if fromTime > untilTime {
 		return nil, fmt.Errorf("Invalid time interval: from time '%d' is after until time '%d'", fromTime, untilTime)
@@ -1011,6 +1072,11 @@ func (whisper *Whisper) Fetch(fromTime, untilTime int) (timeSeries *TimeSeries, 
 	var archive *archiveInfo
 	for _, archive = range whisper.archives {
 		if archive.MaxRetention() >= diff {
+			// TODO: select a default aggregation policy
+			if spec != nil && archive.aggregationSpec != nil && *spec != *archive.aggregationSpec {
+				continue
+			}
+
 			break
 		}
 	}
@@ -1246,6 +1312,8 @@ type archiveInfo struct {
 	blockRanges []blockRange // TODO: remove: sorted by start
 	blockSize   int
 	cblock      blockInfo // mostly for quick block write
+
+	aggregationSpec *MixAggregationSpec
 
 	stats struct {
 		// interval and value stats are not saved on disk because they could be

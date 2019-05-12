@@ -115,6 +115,14 @@ func (archive *archiveInfo) dumpInfoCompressed() {
 	fmt.Printf("block_count:          %d\n", archive.blockCount)
 	fmt.Printf("points_per_block:     %d\n", archive.calculateSuitablePointsPerBlock(archive.whisper.pointsPerBlock))
 	fmt.Printf("compression_ratio:    %f (%d/%d)\n", float64(archive.blockSize*archive.blockCount)/float64(archive.Size()), archive.blockSize*archive.blockCount, archive.Size())
+	if archive.aggregationSpec != nil {
+		if archive.aggregationSpec.Method == Percentile {
+			fmt.Printf("aggregation:       p%.2f\n", archive.aggregationSpec.Percentile)
+		} else {
+			fmt.Printf("aggregation:       %s\n", archive.aggregationSpec.Method)
+		}
+	}
+
 	fmt.Printf("cblock\n")
 	fmt.Printf("  index:     %d\n", archive.cblock.index)
 	fmt.Printf("  p[0].interval:     %d\n", archive.cblock.p0.interval)
@@ -148,6 +156,14 @@ func (arc *archiveInfo) dumpDataPointsCompressed() {
 		dps := unpackDataPoints(arc.buffer)
 		for i, p := range dps {
 			fmt.Printf("  % 4d %d: %f\n", i, p.interval, p.value)
+		}
+	}
+
+	if arc.aggregationSpec != nil {
+		if arc.aggregationSpec.Method == Percentile {
+			fmt.Printf("aggregation: p%.2f\n", arc.aggregationSpec.Percentile)
+		} else {
+			fmt.Printf("aggregation: %s\n", arc.aggregationSpec.Method)
 		}
 	}
 
