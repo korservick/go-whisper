@@ -542,6 +542,10 @@ func (whisper *Whisper) initMetaInfo() {
 		}
 
 		if i == 0 {
+			if whisper.aggregationMethod == Mix {
+				// TODO
+				// arc.bufferSize =
+			}
 			continue
 		}
 
@@ -617,6 +621,10 @@ func (whisper *Whisper) blockRangesSize() int {
 }
 
 func (whisper *Whisper) bufferSize() int {
+	if whisper.aggregationMethod == Mix {
+		return 0
+	}
+
 	if len(whisper.archives) == 0 {
 		return 0
 	}
@@ -1303,9 +1311,18 @@ type archiveInfo struct {
 	next    *archiveInfo
 	whisper *Whisper
 
-	// reason:
+	// why having buffer:
+	//
+	// original reasons:
 	// 	1. less file writes per point
 	// 	2. less file reads & no decompressions on propagation
+	//
+	// necessary reasons:
+	//  cwhisper don't handle well on data points coming in ramdon order by
+	//  timestamp, having a buffer allows it to tolerate data points with
+	//  different timestamp coming in non-increasing order for whatever reasons.
+	//  But only the first/base archive is necessary to have it, so it's possible
+	//  to optimize away buffers in lower archives.
 	buffer     []byte
 	bufferSize int
 
