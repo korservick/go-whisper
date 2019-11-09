@@ -1466,11 +1466,11 @@ func (dstw *Whisper) FillCompressed(srcw *Whisper) error {
 		until := int(Now().Unix())
 		from := until - srcArc.MaxRetention()
 
-		srcPoints, err := srcw.Fetch(from, until)
+		srcPoints, err := srcw.FetchByAggregation(from, until, srcArc.aggregationSpec)
 		if err != nil {
 			return err
 		}
-		dstPoints, err := dstw.Fetch(from, until)
+		dstPoints, err := dstw.FetchByAggregation(from, until, srcArc.aggregationSpec)
 		if err != nil {
 			return err
 		}

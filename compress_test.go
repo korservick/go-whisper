@@ -999,6 +999,157 @@ func TestEstimatePointSize(t *testing.T) {
 	return
 }
 
+func TestFillCompressedByMix(t *testing.T) {
+	srcPath := "fill-mix.src.cwsp"
+	dstPath := "fill-mix.dst.cwsp"
+	os.Remove(srcPath)
+	os.Remove(dstPath)
+
+	srcMix, err := CreateWithOptions(
+		srcPath,
+		[]*Retention{
+			{secondsPerPoint: 1, numberOfPoints: 172800},   // 1s:2d
+			{secondsPerPoint: 60, numberOfPoints: 40320},   // 1m:28d
+			{secondsPerPoint: 3600, numberOfPoints: 17520}, // 1h:2y
+		},
+		Mix,
+		0,
+		&Options{
+			Compressed: true, PointsPerBlock: 7200, InMemory: true,
+			MixAggregationSpecs: []MixAggregationSpec{
+				{Method: Average, Percentile: 0},
+				{Method: Sum, Percentile: 0},
+				{Method: Last, Percentile: 0},
+				{Method: Max, Percentile: 0},
+				{Method: Min, Percentile: 0},
+				{Method: Percentile, Percentile: 50},
+				{Method: Percentile, Percentile: 95},
+				{Method: Percentile, Percentile: 99},
+			},
+		},
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	points := []*TimeSeriesPoint{}
+	twoYearsAgo := Now().Add(time.Hour * 24 * 365 * -2)
+	for i := 0; i < 2*365*24-28*24; i++ {
+		points = append(points, &TimeSeriesPoint{
+			Time:  int(twoYearsAgo.Add(time.Hour * time.Duration(i)).Unix()),
+			Value: rand.NormFloat64(),
+		})
+	}
+	if err := srcMix.UpdateMany(points); err != nil {
+		t.Error(err)
+	}
+
+	points = []*TimeSeriesPoint{}
+	oneMonthAgo := Now().Add(time.Hour * 24 * -28)
+	for i := 0; i < 28*24*60-2*24*60; i++ {
+		points = append(points, &TimeSeriesPoint{
+			Time:  int(oneMonthAgo.Add(time.Minute * time.Duration(i)).Unix()),
+			Value: rand.NormFloat64(),
+		})
+	}
+	if err := srcMix.UpdateMany(points); err != nil {
+		t.Error(err)
+	}
+
+	dstMix, err := CreateWithOptions(
+		dstPath,
+		[]*Retention{
+			{secondsPerPoint: 1, numberOfPoints: 172800},   // 1s:2d
+			{secondsPerPoint: 60, numberOfPoints: 40320},   // 1m:28d
+			{secondsPerPoint: 3600, numberOfPoints: 17520}, // 1h:2y
+		},
+		Mix,
+		0,
+		&Options{
+			Compressed: true, PointsPerBlock: 7200, InMemory: true,
+			MixAggregationSpecs: []MixAggregationSpec{
+				{Method: Average, Percentile: 0},
+				{Method: Sum, Percentile: 0},
+				{Method: Last, Percentile: 0},
+				{Method: Max, Percentile: 0},
+				{Method: Min, Percentile: 0},
+				{Method: Percentile, Percentile: 50},
+				{Method: Percentile, Percentile: 95},
+				{Method: Percentile, Percentile: 99},
+			},
+		},
+	)
+	if err != nil {
+		panic(err)
+	}
+	points = []*TimeSeriesPoint{}
+	twoDaysAgo := Now().Add(time.Hour * 24 * -2)
+	for i := 0; i < 60*60*24*2; i++ {
+		points = append(points, &TimeSeriesPoint{
+			Time:  int(twoDaysAgo.Add(time.Second * time.Duration(i)).Unix()),
+			Value: rand.NormFloat64(),
+		})
+	}
+	if err := dstMix.UpdateMany(points); err != nil {
+		t.Error(err)
+	}
+
+	if err := dstMix.file.(*memFile).dumpOnDisk(dstPath + ".bak"); err != nil {
+		t.Error(err)
+	}
+
+	if err := dstMix.FillCompressed(srcMix); err != nil {
+		t.Error(err)
+	}
+
+	if err := dstMix.file.(*memFile).dumpOnDisk(dstPath); err != nil {
+		t.Error(err)
+	}
+	if err := srcMix.file.(*memFile).dumpOnDisk(srcPath); err != nil {
+		t.Error(err)
+	}
+
+	compare := func(w1, w2 *Whisper, from, until int) {
+		valsc, err := w1.Fetch(from, until)
+		if err != nil {
+			t.Error(err)
+		}
+		valss, err := w2.Fetch(from, until)
+		if err != nil {
+			t.Error(err)
+		}
+		var diff, same int
+		for i := 0; i < len(valsc.values); i++ {
+			vc := valsc.values[i]
+			vs := valss.values[i]
+			if math.IsNaN(vc) && math.IsNaN(vs) {
+				same++
+			} else if vc != vs {
+				t.Errorf("%d/%d %d: %v != %v\n", i, len(valsc.values), valsc.fromTime+i*valsc.step, vc, vs)
+				diff++
+			} else {
+				same++
+			}
+		}
+		if diff > 0 {
+			t.Errorf("diff = %d", diff)
+			t.Errorf("same = %d", same)
+		}
+	}
+
+	t.Log("comparing 2 years archive")
+	compare(dstMix, srcMix, int(twoYearsAgo.Unix()), int(Now().Add(time.Hour*24*-28).Unix()))
+	t.Log("comparing 1 month archive")
+	compare(dstMix, srcMix, int(oneMonthAgo.Add(time.Hour).Unix()), int(Now().Add(time.Hour*24*-2-time.Hour).Unix()))
+
+	oldDstMix, err := OpenWithOptions(dstPath+".bak", &Options{})
+	if err != nil {
+		t.Error(err)
+	}
+	t.Log("comparing 2 days archive")
+	compare(dstMix, oldDstMix, int(Now().Add(time.Hour*24*-2+time.Hour).Unix()), int(Now().Unix()))
+}
+
 func BenchmarkWriteCompressed(b *testing.B) {
 	fpath := "benchmark_write.cwsp"
 	os.Remove(fpath)
