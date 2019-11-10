@@ -1150,6 +1150,75 @@ func TestFillCompressedByMix(t *testing.T) {
 	compare(dstMix, oldDstMix, int(Now().Add(time.Hour*24*-2+time.Hour).Unix()), int(Now().Unix()))
 }
 
+func TestFetchMixLowerArchives(t *testing.T) {
+	srcPath := "fetch-mix.cwsp"
+	os.Remove(srcPath)
+
+	srcMix, err := CreateWithOptions(
+		srcPath,
+		[]*Retention{
+			{secondsPerPoint: 1, numberOfPoints: 172800},   // 1s:2d
+			{secondsPerPoint: 60, numberOfPoints: 40320},   // 1m:28d
+			{secondsPerPoint: 3600, numberOfPoints: 17520}, // 1h:2y
+		},
+		Mix,
+		0,
+		&Options{
+			Compressed: true, PointsPerBlock: 7200, InMemory: true,
+			MixAggregationSpecs: []MixAggregationSpec{
+				{Method: Average, Percentile: 0},
+				{Method: Sum, Percentile: 0},
+				{Method: Last, Percentile: 0},
+				{Method: Max, Percentile: 0},
+				{Method: Min, Percentile: 0},
+				{Method: Percentile, Percentile: 50},
+				{Method: Percentile, Percentile: 95},
+				{Method: Percentile, Percentile: 99},
+			},
+		},
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	points := []*TimeSeriesPoint{}
+	// twoYearsAgo := Now().Add(time.Hour * 24 * 365 * -2)
+	// for i := 0; i < 2*365*24-28*24; i++ {
+	// 	points = append(points, &TimeSeriesPoint{
+	// 		Time:  int(twoYearsAgo.Add(time.Hour * time.Duration(i)).Unix()),
+	// 		Value: rand.NormFloat64(),
+	// 	})
+	// }
+	// if err := srcMix.UpdateMany(points); err != nil {
+	// 	t.Error(err)
+	// }
+
+	// points = []*TimeSeriesPoint{}
+	oneMonthAgo := Now().Add(time.Hour * 24 * -2)
+	for i := 0; i < 2*24*60; i++ {
+		points = append(points, &TimeSeriesPoint{
+			Time:  int(oneMonthAgo.Add(time.Minute * time.Duration(i)).Unix()),
+			Value: rand.NormFloat64(),
+		})
+	}
+	if err := srcMix.UpdateMany(points); err != nil {
+		t.Error(err)
+	}
+
+	if err := srcMix.file.(*memFile).dumpOnDisk(srcPath); err != nil {
+		t.Error(err)
+	}
+
+	data, err := srcMix.Fetch(int(oneMonthAgo.Unix()), int(Now().Unix()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = data
+	// pretty.Println(data)
+	// log.Printf("data = %+v\n", len(data.Points()))
+}
+
 func BenchmarkWriteCompressed(b *testing.B) {
 	fpath := "benchmark_write.cwsp"
 	os.Remove(fpath)

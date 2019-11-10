@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 	"unsafe"
+
+	"github.com/kr/pretty"
 )
 
 var (
@@ -290,23 +292,6 @@ func (whisper *Whisper) readHeaderCompressed() (err error) {
 	return nil
 }
 
-type blockInfo struct {
-	index          int
-	crc32          uint32
-	p0, pn1, pn2   dataPoint // pn1/pn2: points at len(block_points) - 1/2
-	lastByte       byte
-	lastByteOffset int
-	lastByteBitPos int
-	count          int
-}
-
-type blockRange struct {
-	index      int
-	start, end int // start and end timestamps
-	count      int
-	crc32      uint32
-}
-
 func (a *archiveInfo) blockOffset(blockIndex int) int {
 	return a.offset + blockIndex*a.blockSize
 }
@@ -340,7 +325,7 @@ func (whisper *Whisper) fetchCompressed(start, end int64, archive *archiveInfo) 
 		if block.end >= int(start) && int(end) >= block.start {
 			buf := make([]byte, archive.blockSize)
 			if err := whisper.fileReadAt(buf, int64(archive.blockOffset(block.index))); err != nil {
-				return nil, fmt.Errorf("fetchCompressed: %s", err)
+				return nil, fmt.Errorf("fetchCompressed.%d.%d: %s", archive.numberOfPoints, block.index, err)
 			}
 
 			var err error
@@ -356,6 +341,50 @@ func (whisper *Whisper) fetchCompressed(start, end int64, archive *archiveInfo) 
 			if p.interval != 0 && int(start) <= p.interval && p.interval <= int(end) {
 				dst = append(dst, p)
 			}
+		}
+	}
+
+	if base := whisper.archives[0]; base != archive && whisper.aggregationMethod == Mix &&
+		start < int64(base.cblock.pn1.interval) && end > int64(base.cblock.p0.interval) {
+		// whisper.fetchCompressed(int64(base.cblock.p0.interval), int64(untilInterval), base)
+		buf := make([]byte, base.blockSize)
+		if err := whisper.fileReadAt(buf, int64(base.blockOffset(base.cblock.index))); err != nil {
+			return nil, fmt.Errorf("fetchCompressed.%d.%d: %s", base.numberOfPoints, base.cblock.index, err)
+		}
+
+		dps, _, err := base.ReadFromBlock(buf, []dataPoint{}, base.cblock.p0.interval, int(end))
+		if err != nil {
+			return dst, err
+		}
+
+		// series = append(series, extra...)
+		var pinterval int
+		var vals []float64
+		for i, dp := range dps {
+			interval := dp.interval - mod(dp.interval, archive.secondsPerPoint)
+			if pinterval == 0 || pinterval == interval {
+				pinterval = interval
+				vals = append(vals, dp.value)
+
+				if i < len(dps)-1 {
+					continue
+				}
+			}
+
+			// check we have enough data points to propagate a value
+			knownPercent := float32(len(vals)) / float32(archive.secondsPerPoint/base.secondsPerPoint)
+			if knownPercent >= whisper.xFilesFactor {
+				var ndp dataPoint
+				ndp.interval = interval
+				if archive.aggregationSpec.Method == Percentile {
+					ndp.value = getPercentile(archive.aggregationSpec.Percentile, vals)
+				} else {
+					ndp.value = aggregate(archive.aggregationSpec.Method, vals)
+				}
+				dst = append(dst, ndp)
+			}
+
+			vals = vals[:]
 		}
 	}
 	return dst, nil
@@ -522,6 +551,8 @@ func (archive *archiveInfo) appendToBlockAndRotate(dps []dataPoint) (rotated boo
 
 func (whisper *Whisper) extendIfNeeded() error {
 	var rets []*Retention
+	var mixSpecs []MixAggregationSpec
+	var mixSizes = make(map[int][]float32)
 	var extend bool
 	var msg string
 	for _, arc := range whisper.archives {
@@ -558,6 +589,29 @@ func (whisper *Whisper) extendIfNeeded() error {
 		}
 
 		rets = append(rets, ret)
+		// if whisper.aggregationMethod != Mix {
+		// 	rets = append(rets, ret)
+		// } else {
+		// 	mixSizes[ret.secondsPerPoint] = append(mixSizes[ret.secondsPerPoint], ret.avgCompressedPointSize)
+
+		// 	if len(rets) == 0 {
+		// 		rets = append(rets, ret)
+		// 		continue
+		// 	}
+
+		// 	if ret.secondsPerPoint != rets[len(rets)-1].secondsPerPoint {
+		// 		rets = append(rets, ret)
+
+		// 		if len(mixSpecs) == 0 {
+		// 			mixSpecs = append(mixSpecs, *arc.aggregationSpec)
+		// 			mixSpecsCont = true
+		// 		} else {
+		// 			mixSpecsCont = false
+		// 		}
+		// 	} else if mixSpecsCont {
+		// 		mixSpecs = append(mixSpecs, *arc.aggregationSpec)
+		// 	}
+		// }
 	}
 
 	if !extend {
@@ -571,10 +625,24 @@ func (whisper *Whisper) extendIfNeeded() error {
 	filename := whisper.file.Name()
 	os.Remove(whisper.file.Name() + ".extend")
 
+	if whisper.aggregationMethod == Mix && len(rets) > 1 {
+		rets, mixSpecs, mixSizes = extractMixSpecs(rets, whisper.archives)
+	}
+
+	pretty.Println(rets)
+	pretty.Println(mixSpecs)
+	pretty.Println(mixSizes)
+
 	nwhisper, err := CreateWithOptions(
 		whisper.file.Name()+".extend", rets,
 		whisper.aggregationMethod, whisper.xFilesFactor,
-		&Options{Compressed: true, PointsPerBlock: DefaultPointsPerBlock, InMemory: whisper.opts.InMemory},
+		&Options{
+			Compressed:                 true,
+			PointsPerBlock:             DefaultPointsPerBlock,
+			InMemory:                   whisper.opts.InMemory,
+			MixAggregationSpecs:        mixSpecs,
+			MixAvgCompressedPointSizes: mixSizes,
+		},
 	)
 	if err != nil {
 		return fmt.Errorf("extend: %s", err)
@@ -623,6 +691,37 @@ func (whisper *Whisper) extendIfNeeded() error {
 	whisper.Extended = true
 
 	return err
+}
+
+func extractMixSpecs(orets Retentions, arcs []*archiveInfo) (Retentions, []MixAggregationSpec, map[int][]float32) {
+	var nrets Retentions
+	var specs []MixAggregationSpec
+	var sizes = make(map[int][]float32)
+	var specsCont bool
+
+	for i, ret := range orets {
+		sizes[ret.secondsPerPoint] = append(sizes[ret.secondsPerPoint], ret.avgCompressedPointSize)
+
+		if len(nrets) == 0 {
+			nrets = append(nrets, ret)
+			continue
+		}
+
+		if ret.secondsPerPoint != nrets[len(nrets)-1].secondsPerPoint {
+			nrets = append(nrets, ret)
+
+			if len(specs) == 0 {
+				specs = append(specs, *arcs[i].aggregationSpec)
+				specsCont = true
+			} else {
+				specsCont = false
+			}
+		} else if specsCont {
+			specs = append(specs, *arcs[i].aggregationSpec)
+		}
+	}
+
+	return nrets, specs, sizes
 }
 
 func (arc *archiveInfo) avgPointsPerBlockReal() float32 {
@@ -1256,6 +1355,8 @@ func dumpBits(data ...uint64) string {
 // higher archive will propagate to lower archive. [wrong]
 //
 // CompressTo should stop compression/return errors when runs into any issues (if feasible).
+//
+// Note: doesn't support mix-aggregation.
 func (whisper *Whisper) CompressTo(dstPath string) error {
 	var rets []*Retention
 	for _, arc := range whisper.archives {
@@ -1495,13 +1596,17 @@ func (dstw *Whisper) FillCompressed(srcw *Whisper) error {
 		rets[i].avgCompressedPointSize = estimatePointSize(points, rets[i], rets[i].calculateSuitablePointsPerBlock(dstw.pointsPerBlock))
 	}
 
+	rets, mixSpecs, mixSizes := extractMixSpecs(rets, srcw.archives)
+
 	newDst, err := CreateWithOptions(
 		dstw.file.Name()+".fill", rets,
 		dstw.aggregationMethod, dstw.xFilesFactor,
 		&Options{
 			FLock: true, Compressed: true,
-			PointsPerBlock: DefaultPointsPerBlock,
-			InMemory:       true, // need to close file if switch to non in-memory
+			PointsPerBlock:             DefaultPointsPerBlock,
+			InMemory:                   true, // need to close file if switch to non in-memory
+			MixAggregationSpecs:        mixSpecs,
+			MixAvgCompressedPointSizes: mixSizes,
 		},
 	)
 	if err != nil {
@@ -1587,25 +1692,30 @@ func (whisper *Whisper) propagateToMixedArchivesCompressed() error {
 	for _, dp := range dps {
 		for _, spp := range spps {
 			interval := dp.interval - mod(dp.interval, spp)
-			if len(dpsBySPP[spp]) > 0 {
-				gdp := dpsBySPP[spp][len(dpsBySPP[spp])-1]
-				if gdp.interval == interval {
-					gdp.values = append(gdp.values, dp.value)
-					continue
-				}
-
-				// check we have enough data points to propagate a value
-				knownPercent := float32(len(gdp.values)) / float32(spp/baseArchive.secondsPerPoint)
-				if knownPercent < whisper.xFilesFactor {
-					gdp.interval = interval
-					gdp.values = []float64{}
-					continue
-				}
-
-				// sorted for percentiles
-				sort.Float64s(gdp.values)
+			if len(dpsBySPP[spp]) == 0 {
+				dpsBySPP[spp] = append(dpsBySPP[spp], &groupedDataPoint{
+					interval: interval,
+					values:   []float64{dp.value},
+				})
+				continue
 			}
-			dpsBySPP[spp] = append(dpsBySPP[spp], &groupedDataPoint{interval: interval, values: []float64{dp.value}})
+
+			gdp := dpsBySPP[spp][len(dpsBySPP[spp])-1]
+			if gdp.interval == interval {
+				gdp.values = append(gdp.values, dp.value)
+				continue
+			}
+
+			// check we have enough data points to propagate a value
+			knownPercent := float32(len(gdp.values)) / float32(spp/baseArchive.secondsPerPoint)
+			if knownPercent < whisper.xFilesFactor {
+				gdp.interval = interval
+				gdp.values = []float64{}
+				continue
+			}
+
+			// sorted for percentiles
+			sort.Float64s(gdp.values)
 		}
 	}
 

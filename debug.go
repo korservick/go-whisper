@@ -78,7 +78,11 @@ func (whisper *Whisper) Dump(all, showDecompressionInfo bool) {
 
 	fmt.Printf("archives:                  %d\n", len(whisper.archives))
 	for i, arc := range whisper.archives {
-		fmt.Printf("archives.%d.retention:      %s\n", i, arc.Retention)
+		var agg string
+		if arc.aggregationSpec != nil {
+			agg = fmt.Sprintf(" (%s)", arc.aggregationSpec)
+		}
+		fmt.Printf("archives.%d.retention:      %s%s\n", i, arc.Retention, agg)
 	}
 
 	for i, arc := range whisper.archives {
@@ -116,11 +120,12 @@ func (archive *archiveInfo) dumpInfoCompressed() {
 	fmt.Printf("points_per_block:     %d\n", archive.calculateSuitablePointsPerBlock(archive.whisper.pointsPerBlock))
 	fmt.Printf("compression_ratio:    %f (%d/%d)\n", float64(archive.blockSize*archive.blockCount)/float64(archive.Size()), archive.blockSize*archive.blockCount, archive.Size())
 	if archive.aggregationSpec != nil {
-		if archive.aggregationSpec.Method == Percentile {
-			fmt.Printf("aggregation:       p%.2f\n", archive.aggregationSpec.Percentile)
-		} else {
-			fmt.Printf("aggregation:       %s\n", archive.aggregationSpec.Method)
-		}
+		// if archive.aggregationSpec.Method == Percentile {
+		// 	fmt.Printf("aggregation:          p%.2f\n", archive.aggregationSpec.Percentile)
+		// } else {
+		// 	fmt.Printf("aggregation:          %s\n", archive.aggregationSpec.Method)
+		// }
+		fmt.Printf("aggregation:          %s\n", archive.aggregationSpec)
 	}
 
 	fmt.Printf("cblock\n")
